@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Student multi-tier architecture with EC2 in public subnet, MySQL RDS in private subnet, and DR-ready subnets.
+
+Resources:
+
+  # VPC
+  StudentVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: student-vpc
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref StudentVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentVPC
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-Website
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentVPC
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet-DR
+
+  # Private subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentVPC
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      CidrBlock: 10.0.100.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet-MySQL
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref StudentVPC
+      AvailabilityZone: !Select [ 1, !GetAZs "" ]
+      CidrBlock: 10.0.101.0/24
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: PrivateSubnet-DR
+
+  # Public Route Table
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref StudentVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # NAT Gateway in PublicSubnet1
+  NATEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      AllocationId: !GetAtt NATEIP.AllocationId
+
+  # Private Route Table
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref StudentVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Security group for website EC2
+  WebSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow HTTP and SSH
+      VpcId: !Ref StudentVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: web-sg
+
+  # Security group for MySQL RDS
+  MySQLSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow MySQL from Web EC2
+      VpcId: !Ref StudentVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebSG
+      Tags:
+        - Key: Name
+          Value: mysql-sg
+
+  # EC2 web server in PublicSubnet1
+  WebsiteEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: ami-05ffe3c48a9991133   # Amazon Linux 2025
+      KeyName: vockey
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref WebSG
+      Tags:
+        - Key: Name
+          Value: Website-EC2
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y httpd mysql
+          systemctl enable httpd
+          systemctl start httpd
+          echo "<h1>Student Web Server</h1>" > /var/www/html/index.html
+
+  # DB Subnet Group for RDS
+  MyDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Private subnets for RDS"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      DBSubnetGroupName: student-db-subnet-group
+
+  # MySQL RDS instance
+  MySQLRDS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: student-mysql
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: 8.0
+      MasterUsername: student
+      MasterUserPassword: Password123!
+      AllocatedStorage: 20
+      VPCSecurityGroups:
+        - !Ref MySQLSG
+      DBSubnetGroupName: !Ref MyDBSubnetGroup
+      MultiAZ: false
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      StorageEncrypted: true
+
+Outputs:
+
+  WebsitePublicIP:
+    Description: Public IP of website EC2
+    Value: !GetAtt WebsiteEC2.PublicIp
+
+  MySQLEndpoint:
+    Description: Endpoint of RDS MySQL
+    Value: !GetAtt MySQLRDS.Endpoint.Address
+
+  VPCID:
+    Description: The created VPC ID
+    Value: !Ref StudentVPC
